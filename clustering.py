@@ -106,29 +106,42 @@ def _merge_to_target_k(clusters: list[Cluster], target_k: int) -> list[Cluster]:
 def select_representatives(
     clusters: list[Cluster],
     representative_strategy: str = "auto",
+    query_embedding: list[float] | np.ndarray | None = None,
 ) -> list[Chunk]:
     representatives = []
 
     for cluster in clusters:
         cluster_chunks = cluster["chunks"]
 
-        if representative_strategy == "score":
-            representative = max(
-                cluster_chunks,
-                key=lambda chunk: chunk.get("score", 0.0),
-            )
+        if representative_strategy == "auto":
+            if any(chunk.get("score", 0.0) > 0 for chunk in cluster_chunks):
+                representative = _select_score_representative(cluster_chunks)
+            else:
+                representative = _select_centroid_representative(cluster_chunks)
+        elif representative_strategy == "score":
+            representative = _select_score_representative(cluster_chunks)
         elif representative_strategy == "centroid":
             representative = _select_centroid_representative(cluster_chunks)
-        elif representative_strategy == "auto":
-            representative = _select_auto_representative(cluster_chunks)
+        elif representative_strategy == "query_closest":
+            representative = _select_query_closest_representative(
+                cluster_chunks,
+                query_embedding,
+            )
+        elif representative_strategy == "longest":
+            representative = _select_longest_representative(cluster_chunks)
         else:
             raise ValueError(
-                "representative_strategy must be one of: auto, score, centroid"
+                "representative_strategy must be one of: "
+                "auto, score, centroid, query_closest, longest"
             )
 
         representatives.append(representative)
 
     return representatives
+
+
+def _select_score_representative(chunks: list[Chunk]) -> Chunk:
+    return max(chunks, key=lambda chunk: chunk.get("score", 0.0))
 
 
 def _select_centroid_representative(chunks: list[Chunk]) -> Chunk:
@@ -140,25 +153,28 @@ def _select_centroid_representative(chunks: list[Chunk]) -> Chunk:
     return chunks[best_index]
 
 
-def _select_auto_representative(chunks: list[Chunk]) -> Chunk:
+def _select_query_closest_representative(
+    chunks: list[Chunk],
+    query_embedding: list[float] | np.ndarray | None,
+) -> Chunk:
+    if query_embedding is None:
+        raise ValueError("query_embedding is required for query_closest strategy.")
+
     embeddings = _normalize_embeddings(_embedding_matrix(chunks))
-    centroid = embeddings.mean(axis=0)
+    query = np.asarray(query_embedding, dtype=np.float32)
 
-    scores = np.asarray([chunk.get("score", 0.0) for chunk in chunks], dtype=np.float32)
-    centroid_similarities = np.asarray(
-        [_cosine_similarity(embedding, centroid) for embedding in embeddings],
-        dtype=np.float32,
+    if query.ndim != 1:
+        raise ValueError("query_embedding must be a 1D array-like structure.")
+
+    if query.shape[0] != embeddings.shape[1]:
+        raise ValueError("query_embedding dimension must match chunk embeddings.")
+
+    best_index = int(
+        np.argmax([_cosine_similarity(embedding, query) for embedding in embeddings])
     )
+    return chunks[best_index]
 
-    if scores.max() > scores.min():
-        scores = (scores - scores.min()) / (scores.max() - scores.min())
 
-    if centroid_similarities.max() > centroid_similarities.min():
-        centroid_similarities = (
-            (centroid_similarities - centroid_similarities.min())
-            / (centroid_similarities.max() - centroid_similarities.min())
-        )
-
-    combined_scores = (0.6 * scores) + (0.4 * centroid_similarities)
-    return chunks[int(np.argmax(combined_scores))]
+def _select_longest_representative(chunks: list[Chunk]) -> Chunk:
+    return max(chunks, key=lambda chunk: len(chunk.get("text", "")))
 
