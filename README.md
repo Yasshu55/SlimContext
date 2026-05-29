@@ -1,6 +1,13 @@
 # SlimContext
 
 
+## Tests
+
+```powershell
+python -m pip install -r requirements.txt
+python -m pytest tests/ -q
+```
+
 ## Run
 
 Activate the environment:
@@ -18,8 +25,36 @@ python -m pip install -r requirements.txt
 Run the project:
 
 ```powershell
-python main.py
+python -m app.scripts.demo_dedupe
 ```
+
+Run the API:
+
+```powershell
+uvicorn app.api:app --reload
+```
+
+Optimize chunks:
+
+```http
+POST /v1/optimize
+```
+
+```json
+{
+  "chunks": [{ "id": "1", "text": "...", "embedding": null, "score": 0.91 }],
+  "query": "How does JWT auth work?",
+  "namespace": "hr-docs",
+  "token_budget": 1500,
+  "target_k": 8,
+  "dedup_threshold": 0.15,
+  "mmr_lambda": 0.5,
+  "representative_strategy": "auto",
+  "compress": true
+}
+```
+
+SlimContext is a post-retrieval, pre-LLM layer. It accepts chunks from a vector database, BM25, hybrid search, tools, logs, or any other retriever, then returns cleaned, deduplicated, diversity-ranked chunks within a token budget. If chunks already include embeddings, the API reuses them and skips local embedding generation.
 
 ## Representative Selection
 
@@ -43,4 +78,25 @@ MMR, or maximal marginal relevance, selects chunks with a greedy loop using `sco
 
 `mmr_lambda` controls the relevance-diversity tradeoff. Values closer to `1.0` favor the most relevant or highest-scoring chunks, even if they are similar to each other. Values closer to `0.0` favor diversity and spread selections across different embedding areas. `0.5` is a balanced default.
 
-MMR enforces chunk count with `target_k`. Token budget is enforced after MMR with `enforce_token_budget`, because a selected chunk can be within `target_k` but still exceed the available token budget.
+MMR enforces chunk count with `target_k`. Token budget is enforced after MMR with `enforce_token_budget`: whole chunks are packed in order until the budget is full. Chunks that alone exceed the budget, or would push the total over, are skipped (`stats.budget_skipped_count`).
+
+If any chunk is missing an embedding, SlimContext re-embeds **all** chunks from text with `embedding_model` (Distill-style), so every vector lives in the same space. If every chunk already has an embedding, client vectors are used as-is.
+
+When `query` is provided, SlimContext embeds it once per request and uses that vector for MMR relevance. Pass `query_embedding` to skip query embedding when you already have it from your retriever.
+
+## Project Structure
+
+```text
+app/
+  api.py                 FastAPI app and /v1/optimize endpoint
+  core/
+    clustering.py        Agglomerative clustering and representative selection
+    compression.py       Lightweight prune and structured placeholder compression
+    dedupe.py            Exact hash dedupe and MinHash near-duplicate helpers
+    mmr.py               MMR ranking and token-budget packing
+  data/
+    chunks.py            Sample policy chunks for local testing
+  scripts/
+    demo_dedupe.py       Local dedupe demo
+    embedding_generator.py
+```

@@ -1,5 +1,6 @@
 from sentence_transformers import SentenceTransformer
-from chunks import chunks
+
+from app.data.chunks import chunks
 
 
 def main() -> None:

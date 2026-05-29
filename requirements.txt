@@ -1,3 +1,9 @@
 datasketch
+numpy
 sentence_transformers
 scikit-learn
+fastapi
+uvicorn
+tiktoken
+pytest
+httpx

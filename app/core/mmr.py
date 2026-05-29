@@ -1,5 +1,6 @@
 import numpy as np
 
+from app.core.vectors import embedding_matrix, normalize_embeddings
 
 Chunk = dict
 
@@ -17,7 +18,7 @@ def select_mmr(
     if not 0.0 <= mmr_lambda <= 1.0:
         raise ValueError("mmr_lambda must be between 0.0 and 1.0.")
 
-    embeddings = _normalize_embeddings(_embedding_matrix(chunks))
+    embeddings = normalize_embeddings(embedding_matrix(chunks))
     relevance = _relevance_scores(chunks, embeddings, query_embedding)
 
     selected_indexes: list[int] = []
@@ -64,46 +65,35 @@ def select_mmr(
 def enforce_token_budget(
     chunks: list[Chunk],
     token_budget: int,
-) -> list[Chunk]:
+    token_counter=None,
+) -> tuple[list[Chunk], int]:
+    """Pack whole chunks into the budget; skip any chunk that does not fit."""
     if token_budget <= 0:
-        return []
+        return [], len(chunks)
 
-    selected = []
+    if not chunks:
+        return [], 0
+
+    counter = token_counter or _token_count
+    selected: list[Chunk] = []
     used_tokens = 0
+    skipped = 0
 
     for chunk in chunks:
-        token_count = _token_count(chunk)
+        token_count = counter(chunk)
+
+        if token_count > token_budget:
+            skipped += 1
+            continue
 
         if used_tokens + token_count > token_budget:
+            skipped += 1
             continue
 
         selected.append(chunk)
         used_tokens += token_count
 
-    return selected
-
-
-def _embedding_matrix(chunks: list[Chunk]) -> np.ndarray:
-    embeddings = []
-
-    for chunk in chunks:
-        embedding = chunk.get("embedding")
-        if embedding is None:
-            raise ValueError(f"Chunk {chunk.get('id')} is missing an embedding.")
-        embeddings.append(embedding)
-
-    matrix = np.asarray(embeddings, dtype=np.float32)
-
-    if matrix.ndim != 2:
-        raise ValueError("Chunk embeddings must be a 2D array-like structure.")
-
-    return matrix
-
-
-def _normalize_embeddings(embeddings: np.ndarray) -> np.ndarray:
-    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-    norms[norms == 0] = 1.0
-    return embeddings / norms
+    return selected, skipped
 
 
 def _normalize_scores(scores: np.ndarray) -> np.ndarray:

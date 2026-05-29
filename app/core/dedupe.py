@@ -1,9 +1,10 @@
-from chunks import chunks
 import hashlib
 import re
 
 from datasketch import MinHash
 
+
+Chunk = dict
 
 NEAR_DUPLICATE_THRESHOLD = 0.8
 SHINGLE_SIZE = 4
@@ -19,17 +20,33 @@ def chunk_hash(text: str) -> str:
     return hashlib.sha256(normalize_text(text).encode("utf-8")).hexdigest()
 
 
-def remove_exact_duplicates(items: list[str]) -> list[str]:
-    seen_hashes: dict[str, int] = {}
+def remove_exact_duplicate_texts(items: list[str]) -> list[str]:
+    seen_hashes: set[str] = set()
     unique_chunks: list[str] = []
 
-    for index, chunk in enumerate(items):
+    for chunk in items:
         digest = chunk_hash(chunk)
 
         if digest in seen_hashes:
             continue
 
-        seen_hashes[digest] = index
+        seen_hashes.add(digest)
+        unique_chunks.append(chunk)
+
+    return unique_chunks
+
+
+def remove_exact_duplicate_chunks(chunks: list[Chunk], namespace: str) -> list[Chunk]:
+    seen_hashes: set[str] = set()
+    unique_chunks: list[Chunk] = []
+
+    for chunk in chunks:
+        digest = f"{namespace}:{chunk_hash(chunk['text'])}"
+
+        if digest in seen_hashes:
+            continue
+
+        seen_hashes.add(digest)
         unique_chunks.append(chunk)
 
     return unique_chunks
@@ -56,7 +73,7 @@ def minhash_for(text: str) -> MinHash:
     return signature
 
 
-def remove_near_duplicates(
+def remove_near_duplicate_texts(
     items: list[str], threshold: float = NEAR_DUPLICATE_THRESHOLD
 ) -> list[str]:
     kept_chunks: list[str] = []
@@ -79,21 +96,3 @@ def remove_near_duplicates(
         kept_signatures.append(signature)
 
     return kept_chunks
-
-
-def main() -> None:
-    print(f"Loaded {len(chunks)} chunks.")
-
-    exact_unique_chunks = remove_exact_duplicates(chunks)
-    deduplicated_chunks = remove_near_duplicates(exact_unique_chunks)
-
-    print(f"After exact hash deduplication: {len(exact_unique_chunks)} chunks.")
-    print(f"After near-duplicate removal: {len(deduplicated_chunks)} chunks.")
-
-    print("\nFinal chunks:")
-    for index, chunk in enumerate(deduplicated_chunks):
-        print(f"{index + 1}. {chunk}")
-
-
-if __name__ == "__main__":
-    main()
