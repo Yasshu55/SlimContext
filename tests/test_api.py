@@ -53,4 +53,6 @@ def test_optimize_with_precomputed_embeddings() -> None:
     body = response.json()
     assert body["stats"]["exact_duplicate_count"] == 1
     assert body["stats"]["output_count"] == 2
+    assert "cluster_sizes" not in body["stats"]
     assert len(body["chunks"]) == 2
+    assert all("embedding" not in chunk for chunk in body["chunks"])

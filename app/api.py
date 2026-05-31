@@ -35,6 +35,13 @@ class ChunkIn(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class ChunkOut(BaseModel):
+    id: str
+    text: str
+    score: float = 0.0
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
 class OptimizeRequest(BaseModel):
     chunks: list[ChunkIn] = Field(min_length=1, max_length=MAX_CHUNKS_PER_REQUEST)
     query: str = ""
@@ -62,7 +69,6 @@ class OptimizeStats(BaseModel):
     output_count: int
     exact_duplicate_count: int
     cluster_count: int
-    cluster_sizes: list[int]
     input_tokens: int
     output_tokens: int
     reduction_pct: float
@@ -71,7 +77,7 @@ class OptimizeStats(BaseModel):
 
 
 class OptimizeResponse(BaseModel):
-    chunks: list[ChunkIn]
+    chunks: list[ChunkOut]
     stats: OptimizeStats
 
 
@@ -121,13 +127,12 @@ def optimize(request: OptimizeRequest) -> OptimizeResponse:
         latency_ms = int((time.perf_counter() - started_at) * 1000)
 
         return OptimizeResponse(
-            chunks=[ChunkIn(**chunk) for chunk in final_chunks],
+            chunks=[ChunkOut(**chunk) for chunk in final_chunks],
             stats=OptimizeStats(
                 input_count=len(chunks),
                 output_count=len(final_chunks),
                 exact_duplicate_count=len(chunks) - len(exact_unique_chunks),
                 cluster_count=len(clusters),
-                cluster_sizes=[len(cluster["chunks"]) for cluster in clusters],
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 reduction_pct=_reduction_pct(input_tokens, output_tokens),

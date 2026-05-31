@@ -7,3 +7,6 @@ uvicorn
 tiktoken
 pytest
 httpx
+httpx2
+deepeval
+matplotlib

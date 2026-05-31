@@ -1,0 +1,6 @@
+metric,without_slimcontext,with_slimcontext
+Avg input tokens,16289,529
+Token reduction,-,96.75%
+Answer quality (LLM judge 1-10),0.0,10.0
+Cost per 1M calls (Ollama Qwen token proxy),$81.45,$2.65
+Pipeline latency added,0ms,-119994.82ms
