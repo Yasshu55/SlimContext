@@ -1,142 +1,281 @@
 # SlimContext
 
-Post-retrieval context optimizer: hash dedup → embed → semantic dedup → topical clustering → representative selection → MMR → compress → token budget.
+**Post-retrieval context optimizer for RAG — deterministic, fast, no LLM.**
 
-SlimContext sits between your retriever and your LLM. You send it the chunks your vector DB, BM25, or hybrid search returned. It hands back only the ones worth sending — deduplicated, clustered, diversity-ranked, and trimmed to a token budget.
+SlimContext is a standalone Python service for the **retrieve → optimize → generate** step in RAG. It takes over-fetched chunks from your vector DB, BM25, or hybrid retriever and returns a smaller set that maximizes **information per token**: deduplicated, topically grouped, diversity-ranked, and trimmed to a budget.
 
-## Run
+**No LLM calls.** Same input always yields the same output. Typical latency is single-digit to low hundreds of milliseconds depending on whether embeddings are supplied by the caller.
 
-Activate the environment:
+---
+
+## The problem
+
+Production RAG usually **over-fetches** on purpose: retrieve 20–50 chunks, then hope the model figures it out. In practice:
+
+- **30–40% of retrieved context is semantically redundant** (same idea, different wording).
+- **High-scoring chunks cluster on one theme** (e.g. five “Redis is a cache” passages) while other useful topics never reach the LLM.
+- **Token cost and latency scale with raw chunk count**, not with useful facts.
+
+Fetching fewer results from the vector DB hurts **recall**. The better pattern is:
+
+> **Over-fetch for recall → optimize for precision and diversity → send to the LLM.**
+
+SlimContext is that optimization step, exposed as a small HTTP API.
+
+---
+
+## Where it fits
+
+```
+Vector DB / BM25 / hybrid search
+        ↓  (over-fetch: many chunks + scores + embeddings)
+   SlimContext                    ← you are here
+        ↓  (dedupe · cluster · MMR · budget)
+        LLM
+```
+
+---
+
+## Architecture
+
+### End-to-end pipeline
+
+```
+┌─────────────┐   ┌──────────────────┐   ┌─────────────────┐   ┌──────────────┐
+│ Exact dedup │ → │ Semantic dedup   │ → │ Topical cluster │ → │ Representative│
+│ (hash)      │   │ (paraphrase +    │   │ (intent / hybrid│   │ (1 per cluster)│
+│             │   │  intent collapse)│   │  text+embedding)│   │               │
+└─────────────┘   └──────────────────┘   └─────────────────┘   └───────┬──────┘
+                                                                         ↓
+┌─────────────┐   ┌──────────────────┐   ┌─────────────────────────────────┐
+│ Compression │ ← │ Token budget     │ ← │ MMR selection (relevance +       │
+│ (optional)  │   │ (pack in order)  │   │  diversity across topics)        │
+└─────────────┘   └──────────────────┘   └─────────────────────────────────┘
+```
+
+Canonical RAG optimization path:
+
+```
+Query → Over-fetch (N) → Cluster → Select → MMR (k) → LLM
+```
+
+SlimContext adds an explicit **semantic dedup** stage before clustering so paraphrases do not consume `target_k` slots.
+
+### What each layer does (and why)
+
+| Layer | What it does | Why it exists |
+|-------|----------------|---------------|
+| **1. Exact dedup** | SHA-256 hash of normalized text, scoped by `namespace`. | Cheap, perfect removal of copy-paste duplicates from multi-source retrieval. |
+| **2. Embed** (optional) | If any chunk lacks an embedding, encode all texts with `BAAI/bge-small-en-v1.5` (single vector space). | Clustering and MMR need vectors; callers with precomputed embeddings skip this entirely. |
+| **3. Semantic dedup** | Two passes on chunks still ranked by retrieval `score`: **(a) Pairwise paraphrase removal** — drop a lower-scored chunk when embeddings are nearly identical *and* TF-IDF overlap suggests the same claim (not merely the same topic). **(b) Intent collapse** — assign a lightweight topic label from keywords (e.g. `caching`, `session`, `messaging`, `rate_limiting`) and keep only the top-scored chunk per label. | Example: five retrieved passages all explain “Redis caches hot data in RAM” (`redis_core_1`, `redis_cache_paraphrase`, `semantic_overlap_1`, …). After this stage you keep **one** caching passage (highest score), plus separate winners for session storage, pub/sub, persistence, etc. That is different from topical clustering (layer 4), which groups what is left; semantic dedup answers “have we already said this?” |
+| **4. Topical clustering** | Group remaining chunks by intent labels when possible; otherwise agglomerative clustering on a **hybrid** distance (text-weighted when embeddings are collapsed). | Produces meaningful `cluster_count` and one representative per *idea*, not one blob per embedding cone. |
+| **5. Representative selection** | Pick the best chunk per cluster (`auto` = highest retrieval `score`, or centroid / query-closest / longest). | Reduces each topic to its strongest evidence before diversity ranking. |
+| **6. MMR** | Maximal Marginal Relevance: `λ × relevance − (1−λ) × diversity_penalty`. Diversity uses embedding similarity **and** lexical overlap vs. already-selected chunks. | Maximizes **marginal information gain** under `target_k`, not raw cosine score alone. |
+| **7. Compression** | Light filler removal; structured text truncated with a placeholder. | Cuts noise without an LLM summarizer. |
+| **8. Token budget** | Pack whole chunks in MMR order until `token_budget` is full; skip chunks that do not fit. | Hard cap for model context windows and cost control. |
+
+**Design principle:** optimize for **useful coverage under a token budget**, not minimum redundancy alone. A dedup engine returns one chunk; a context optimizer returns one chunk *per distinct intent* (up to `target_k`).
+
+---
+
+## Why no LLM?
+
+| Approach | Deterministic | Typical latency | Cost |
+|----------|---------------|-----------------|------|
+| LLM compression / rerank | No | ~500ms+ | Per-token API |
+| **SlimContext** | **Yes** | **~2ms** (precomputed embeddings) to **~600ms** (server-side embed) | Compute only |
+
+Algorithms only: cosine distance, TF-IDF, agglomerative clustering, MMR. Auditable, testable, safe to run on every request.
+
+---
+
+## Quick start
 
 ```powershell
+cd SlimContext
+python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-```
-
-Install packages:
-
-```powershell
-python -m pip install -r requirements.txt
-```
-
-Run the API:
-
-```powershell
+pip install -r requirements.txt
 uvicorn app.api:app --reload
 ```
 
+Health check: `GET http://127.0.0.1:8000/health`
+
+---
+
 ## API
 
-```http
-POST /v1/optimize
-```
+### `POST /v1/optimize`
+
+**Request** (minimal):
 
 ```json
 {
-  "chunks": [{ "id": "1", "text": "...", "embedding": null, "score": 0.91 }],
-  "query": "How does JWT auth work?",
-  "namespace": "hr-docs",
-  "token_budget": 1500,
+  "query": "How does Redis improve performance in distributed systems?",
+  "query_embedding": [0.81, 0.64, 0.72, 0.90],
+  "namespace": "docs",
+  "chunks": [
+    {
+      "id": "chunk-1",
+      "text": "Redis stores hot data in memory...",
+      "embedding": [0.80, 0.63, 0.71, 0.89],
+      "score": 0.95
+    }
+  ],
   "target_k": 8,
-  "dedup_threshold": 0.15,
+  "token_budget": 1800,
   "semantic_dedup_threshold": 0.001,
+  "dedup_threshold": 0.15,
   "mmr_lambda": 0.5,
   "representative_strategy": "auto",
   "compress": true
 }
 ```
 
-`embedding` is optional. If any chunk is missing one, SlimContext embeds all chunks server-side using `embedding_model` (default: `BAAI/bge-small-en-v1.5`). If every chunk already has an embedding, client vectors are used as-is and embedding generation is skipped entirely.
+**Response:**
 
-`token_budget` is optional. When omitted or `null`, no token cap is applied after MMR.
-
-## Benchmark
-
-Two paths were compared: send all retrieved chunks to the LLM as-is, or run them through SlimContext first (`target_k=1`, `dedup_threshold=0.15`, `mmr_lambda=0.8`, `compress=false`, caller-supplied embeddings). Answer correctness was checked with GPT-5.5 using only the provided context.
-
-| Metric | Without SlimContext | With SlimContext | Change |
-|---|---:|---:|---|
-| Chunks sent to LLM | 5 | 1 | −4 (80%) |
-| Input tokens | 319 | 134 | −185 |
-| Token reduction | — | **57.99%** | — |
-| Exact duplicates removed | — | 1 | — |
-| Irrelevant chunks removed | — | 3 | — |
-| Clusters formed | — | 3 | — |
-| Budget-skipped chunks | — | 0 | — |
-| Answer correct | ✓ | ✓ | Same |
-| Optimize latency | — | **2 ms** | — |
-
-Token cost proxy at $0.005 / 1K input tokens:
-
-| Metric | Without SlimContext | With SlimContext |
-|---|---:|---:|
-| Cost per request | $0.00160 | $0.00067 |
-| Cost per 1M requests | $1,595 | $670 |
-| Savings per 1M requests | — | **$925 (57.99%)** |
-
-```
-tokens_saved = input_tokens − output_tokens          → 319 − 134 = 185
-reduction_pct  = (tokens_saved / input_tokens) × 100 → 57.99%
-cost_per_req   = tokens × $0.000005
+```json
+{
+  "chunks": [{ "id": "chunk-1", "text": "...", "score": 0.95, "metadata": {} }],
+  "stats": {
+    "input_count": 21,
+    "output_count": 7,
+    "exact_duplicate_count": 1,
+    "semantic_duplicate_count": 4,
+    "cluster_count": 7,
+    "input_tokens": 573,
+    "output_tokens": 210,
+    "reduction_pct": 63.35,
+    "latency_ms": 12,
+    "budget_skipped_count": 0
+  }
+}
 ```
 
-With pre-supplied embeddings, SlimContext only ran dedup → cluster → MMR → budget enforcement — no server-side embedding work.
+### Parameters
 
-### Latency
+| Field | Default | Role |
+|-------|---------|------|
+| `chunks` | required | Retrieved passages (`id`, `text`, optional `embedding`, `score`, `metadata`). |
+| `namespace` | `"default"` | Isolates exact-dedup hashes across tenants / indexes. |
+| `query` | `""` | Used to embed a query vector when `query_embedding` is omitted. |
+| `query_embedding` | optional | Query vector for MMR relevance; preferred when the retriever already has it. |
+| `target_k` | `8` | Max chunks after MMR. |
+| `token_budget` | optional | Max tokens after MMR; `null` = no cap. |
+| `semantic_dedup_threshold` | `0.001` | Tight cosine distance for paraphrase detection (see tuning). |
+| `dedup_threshold` | `0.15` | Topical clustering distance (looser than semantic dedup). |
+| `cluster_threshold` | optional | Overrides `dedup_threshold` for clustering only. |
+| `mmr_lambda` | `0.5` | `1.0` = relevance only, `0.0` = diversity only. |
+| `representative_strategy` | `auto` | `auto` \| `score` \| `centroid` \| `query_closest` \| `longest` |
+| `max_per_cluster` | `1` | If `>1`, send up to N chunks per cluster into MMR before final selection. |
+| `compress` | `true` | Apply lightweight compression to output text. |
+| `embedding_model` | `BAAI/bge-small-en-v1.5` | Used only when any chunk is missing an embedding. |
 
-| Scenario | Observed / typical |
-|---|---|
-| Embeddings provided by caller | **2 ms** (observed) |
-| Server-side embedding, warm model | 200–600 ms |
-| First request, model loading from disk | 1–5 s |
+### Representative strategies
 
-### Reproduce pipeline metrics
+After topical clustering, several chunks may still belong to the same group (e.g. three passages tagged `caching` that survived semantic dedup because wording differed enough). **Representative selection** picks **one chunk per cluster** to send forward to MMR. That keeps MMR focused on *topics*, not on picking among siblings in the same cluster.
 
-Run the optimizer pipeline locally without an LLM API:
+Set via `representative_strategy` (default: `auto`).
+
+| Strategy | How the winner is chosen | Best for |
+|----------|--------------------------|----------|
+| **`auto`** | If any chunk in the cluster has `score > 0`, use **`score`**; otherwise use **`centroid`**. | Most RAG pipelines (vector DB or reranker already provides scores). |
+| **`score`** | Highest `score` in the cluster. | Hybrid / BM25 / vector search where `score` reflects retriever confidence. |
+| **`centroid`** | Chunk whose embedding is closest to the cluster’s average embedding. | Tool output, logs, or scraped text with no retrieval score — picks the most “typical” passage, not the longest or highest arbitrary score. |
+| **`query_closest`** | Chunk whose embedding has highest cosine similarity to `query_embedding`. Requires `query_embedding` (or `query` so the server can embed it). | Q&A when the best evidence is “closest to what the user asked,” not highest retriever score (e.g. a lower-ranked chunk that directly answers the question). |
+| **`longest`** | Chunk with the most characters in `text`. | Summarization or context packing when length proxies for detail (use carefully — long ≠ relevant). |
+
+**Example.** One cluster contains:
+
+- `redis_core_1` — score `0.96`, defines in-memory caching  
+- `redis_cache_paraphrase` — score `0.94`, shorter paraphrase  
+
+With `score` or `auto`, `redis_core_1` becomes the representative. With `query_closest`, the winner depends on which embedding aligns better with the query vector.
+
+**Interaction with `max_per_cluster`.** Default `max_per_cluster=1`: only representatives go to MMR. If `max_per_cluster > 1`, up to N highest-scored chunks *per cluster* are passed to MMR instead of a single representative — useful when a cluster is broad and you want MMR to trim within it.
+
+---
+
+## Tuning
+
+Use **two thresholds** — they answer different questions:
+
+| Parameter | Question it answers | Typical range |
+|-----------|---------------------|---------------|
+| `semantic_dedup_threshold` | “Are these the same information?” | `0.0005` – `0.02` (keep tight) |
+| `dedup_threshold` | “Which chunks belong to the same topic?” | `0.10` – `0.35` (looser) |
+
+**MMR:**
+
+```
+mmr_score = λ × relevance − (1 − λ) × diversity_penalty
+```
+
+- Relevance: cosine(query, chunk) if `query_embedding` set, else normalized retrieval `score`.
+- Diversity penalty: max(embedding similarity, lexical similarity) vs. already-selected chunks.
+
+**Practical defaults for prose RAG:** `semantic_dedup_threshold=0.001`, `dedup_threshold=0.15`, `mmr_lambda=0.5–0.75`, `target_k=6–10`.
+
+**Note:** Low-dimensional or hand-made test embeddings often sit in a tight cone; SlimContext compensates with text/intent signals. Use real embeddings (e.g. bge-small) for production tuning.
+
+---
+
+## Benchmarks
+
+**The latencies below are from the offline benchmark script, which does not use caller-supplied embeddings** (it builds 64-dim hash vectors per chunk). On `POST /v1/optimize` with embeddings already attached to every chunk, the same pipeline is typically **under ~10 ms per request** — often faster — because no embedding model runs.
+
+Pipeline-only evaluation on `benchmarks/data/dirty_test_set.json` (100 RAG-style cases, 5 noisy chunks each including one exact duplicate and one `truth` chunk). **No LLM calls** — metrics are word counts, chunk counts, whether the `truth` chunk survived, and wall-clock time. Embeddings are **deterministic 64-dim hash vectors** generated inside the script (not BGE).
+
+From the project root (`SlimContext/`):
 
 ```powershell
+$env:PYTHONPATH = (Get-Location)
 python benchmarks/run_dirty_eval.py --target-k 1 --dedup-threshold 0.15 --mmr-lambda 0.8
 ```
 
-Outputs go to `benchmarks/results/manual_eval/` (`summary.json`, `summary.csv`, spot-check prompt).
-
-## Representative Selection
-
-`auto` is the recommended default. It selects by `score` when any chunk in the cluster has a retrieval score greater than `0` — the normal case for RAG chunks ranked by a vector DB or reranker. Falls back to `centroid` when no usable score is present.
-
-| Strategy | When to use |
-|---|---|
-| `auto` | Default. Score-based when scores exist, centroid otherwise |
-| `score` | Chunks already ranked by vector DB, hybrid search, or reranker |
-| `centroid` | No meaningful scores — logs, tool dumps, mixed-source content |
-| `query_closest` | Q&A flows where proximity to the query matters most |
-| `longest` | Summarization or context packing where information density is preferred |
-
-## Threshold Tuning
-
-Use two thresholds — they solve different problems:
-
-| Parameter | Purpose | Typical range |
-|---|---|---|
-| `semantic_dedup_threshold` | Remove near-duplicate embeddings before MMR (also requires high text overlap) | `0.001`–`0.02` |
-| `dedup_threshold` / `cluster_threshold` | Topical clustering for stats / optional `max_per_cluster` | `0.10`–`0.35` (looser) |
-
-`semantic_dedup_threshold` should stay tight so paraphrases and distinct use cases are not merged. `dedup_threshold` controls how aggressively chunks are grouped for `cluster_count` and optional per-cluster sampling (`max_per_cluster` > 1).
-
-With mock or low-dimensional embeddings, vectors often sit in a tight cone — rely on MMR plus the built-in text diversity penalty rather than expecting clustering alone to separate topics.
-
-## MMR Selection
-
-MMR (maximal marginal relevance) selects chunks with:
-
-```
-score = lambda × relevance − (1 − lambda) × diversity_penalty
+```bash
+PYTHONPATH=. python benchmarks/run_dirty_eval.py --target-k 1 --dedup-threshold 0.15 --mmr-lambda 0.8
 ```
 
-Relevance uses `query_embedding` when provided, otherwise normalized chunk `score`. The diversity penalty is the max cosine similarity between the candidate and anything already selected.
+Outputs: `benchmarks/results/manual_eval/summary.json`, `summary.csv`, `spot_check_case_1.md`.
 
-`mmr_lambda` controls the tradeoff. `1.0` = pure relevance, `0.0` = pure diversity, `0.5` = balanced default.
+### Results (measured May 2026)
 
-`target_k` sets the chunk count limit. Token budget is enforced after MMR — chunks are packed in order until the budget is full. Chunks that would push the total over are skipped (`stats.budget_skipped_count`).
+**Config:** `--target-k 1 --dedup-threshold 0.15 --semantic-dedup-threshold 0.001` (default) `--mmr-lambda 0.8` `--token-budget 1500`
+
+| Metric | Value |
+|--------|------:|
+| Cases evaluated | 100 |
+| Total words (raw retrieved context) | 26,685 |
+| Total words (after SlimContext) | 7,102 |
+| Word reduction | **73.39%** |
+| Truth chunk retained (`id: truth`) | **48%** of cases |
+| Total runtime | 2,594.67 ms |
+| Avg latency per case | **25.95 ms** |
+
+**Same dataset with more output slots:** `--target-k 8 --mmr-lambda 0.75`
+
+| Metric | Value |
+|--------|------:|
+| Total words (after SlimContext) | 10,149 |
+| Word reduction | **61.97%** |
+| Truth chunk retained | **48%** of cases |
+| Avg latency per case | **9.53 ms** |
+
+**Example — case 1** (Massachusetts compulsory education query):
+
+| Metric | Before | After |
+|--------|-------:|------:|
+| Chunks | 5 | 1 |
+| Words | 206 | 59 |
+| Word reduction | — | 71.36% |
+| Exact duplicates removed | — | 1 |
+| Clusters formed | — | 4 |
+| Truth retained | — | no (`exact_duplicate` kept over `truth`, same text, higher pipeline order) |
+
+Interpretation: high **reduction** is expected with `target_k=1`. **Truth retention** depends on scores, clustering, and MMR — it is not an answer-quality benchmark. For production, use real retriever embeddings and tune `target_k`, `mmr_lambda`, and thresholds on your own data.
+
+---
 
 ## Tests
 
@@ -144,41 +283,48 @@ Relevance uses `query_embedding` when provided, otherwise normalized chunk `scor
 python -m pytest tests/ -q
 ```
 
-Fast checks use fake embeddings — no model download required.
+Unit tests use synthetic embeddings — no model download required.
 
-| File | What it verifies |
-|------|------------------|
-| `test_dedupe.py` | Exact duplicate removal and namespace isolation |
-| `test_semantic_dedup.py` | Embedding + text gated near-duplicate removal |
-| `test_realworld_redis.py` | Diverse Redis RAG selection (no single-chunk collapse) |
-| `test_clustering.py` | Similar vectors cluster together |
-| `test_mmr.py` | MMR `target_k` and token budget skipping |
-| `test_embeddings.py` | Re-embed-all when any embedding is missing |
-| `test_api.py` | Full HTTP endpoint with precomputed vectors |
-| `test_benchmark_metrics.py` | Token reduction, cost, and summary math |
-| `test_benchmark_rag.py` | Benchmark prompt construction smoke test |
+| Test | Covers |
+|------|--------|
+| `test_dedupe.py` | Exact duplicate removal, namespace isolation |
+| `test_semantic_dedup.py` | Paraphrase / near-duplicate removal |
+| `test_realworld_redis.py` | Multi-topic RAG set (no single-chunk collapse) |
+| `test_clustering.py` | Vector clustering |
+| `test_mmr.py` | `target_k`, token budget |
+| `test_api.py` | HTTP `/v1/optimize` |
+| `test_embeddings.py` | Re-embed when any vector is missing |
 
-## Project Structure
+---
+
+## Project layout
 
 ```
 app/
-  api.py                 FastAPI app and /v1/optimize endpoint
+  api.py                  # FastAPI — POST /v1/optimize
   core/
-    clustering.py        Agglomerative clustering and per-cluster candidate selection
-    semantic_dedup.py    Tight embedding near-duplicate removal
-    compression.py       Lightweight prune and structured placeholder compression
-    dedupe.py            Exact hash dedupe and MinHash near-duplicate helpers
-    mmr.py               MMR ranking and token-budget packing
-  data/
-    chunks.py            Sample policy chunks for local testing
-  scripts/
-    demo_dedupe.py       Local dedupe demo
-    embedding_generator.py
+    dedupe.py             # Exact hash dedup
+    semantic_dedup.py     # Paraphrase + intent collapse
+    clustering.py         # Topical clusters + representatives
+    mmr.py                # MMR + token budget packing
+    compression.py        # Deterministic text pruning
+    text_similarity.py    # Lexical / TF-IDF helpers
+    intent.py             # Lightweight topic labels
+    vectors.py            # Embedding utilities
 benchmarks/
-  build_dirty_squad_dataset.py
-  run_dirty_eval.py
-  benchmark_rag.py
-  metrics.py
-  data/
-    dirty_test_set.json
+  run_dirty_eval.py       # Pipeline metrics without an LLM
+  data/dirty_test_set.json
+tests/
 ```
+
+---
+
+## Credits
+
+Pipeline concepts (over-fetch, semantic dedup, clustering, MMR) draw on ideas explored in [Distill](https://github.com/Siddhant-K-code/distill) and the [Agentic Engineering Guide — context engineering stack](https://agents.siddhantkhare.com/05-context-engineering-stack/). SlimContext is an independent project with its own codebase and API.
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE) in this repository.
