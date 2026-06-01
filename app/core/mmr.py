@@ -1,5 +1,6 @@
 import numpy as np
 
+from app.core.text_similarity import text_similarity
 from app.core.vectors import embedding_matrix, normalize_embeddings
 
 Chunk = dict
@@ -35,6 +36,8 @@ def select_mmr(
                 embeddings[index],
                 embeddings,
                 selected_indexes,
+                chunks[index],
+                chunks,
             )
             mmr_score = (
                 mmr_lambda * relevance[index]
@@ -132,12 +135,23 @@ def _max_similarity_to_selected(
     embedding: np.ndarray,
     embeddings: np.ndarray,
     selected_indexes: list[int],
+    chunk: Chunk,
+    chunks: list[Chunk],
 ) -> float:
     if not selected_indexes:
         return 0.0
 
     selected_embeddings = embeddings[selected_indexes]
-    return float(np.max(selected_embeddings @ embedding))
+    embedding_similarity = float(np.max(selected_embeddings @ embedding))
+
+    chunk_text = chunk.get("text", "")
+    lexical_similarities = [
+        text_similarity(chunk_text, chunks[selected_index].get("text", ""))
+        for selected_index in selected_indexes
+    ]
+    lexical_similarity = max(lexical_similarities) if lexical_similarities else 0.0
+
+    return max(embedding_similarity, lexical_similarity)
 
 
 def _token_count(chunk: Chunk) -> int:

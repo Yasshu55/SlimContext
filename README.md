@@ -1,25 +1,8 @@
 # SlimContext
 
-Post-retrieval context optimizer: hash dedup -> embed -> cluster -> select -> MMR -> compress -> token budget.
+Post-retrieval context optimizer: hash dedup → embed → semantic dedup → topical clustering → representative selection → MMR → compress → token budget.
 
-## Tests
-
-```powershell
-python -m pip install -r requirements.txt
-python -m pytest tests/ -q
-```
-
-Fast checks use fake embeddings, no model download.
-
-| File | What it verifies |
-|------|------------------|
-| `test_dedupe.py` | exact duplicate removal + namespace isolation |
-| `test_clustering.py` | similar vectors cluster together |
-| `test_mmr.py` | MMR target_k + token budget skipping |
-| `test_embeddings.py` | re-embed-all when any embedding missing |
-| `test_api.py` | full HTTP endpoint with precomputed vectors |
-| `test_benchmark_metrics.py` | benchmark dataset loading, token reduction, cost, and summary math |
-| `test_benchmark_rag.py` | benchmark prompt construction smoke test |
+SlimContext sits between your retriever and your LLM. You send it the chunks your vector DB, BM25, or hybrid search returned. It hands back only the ones worth sending — deduplicated, clustered, diversity-ranked, and trimmed to a token budget.
 
 ## Run
 
@@ -35,19 +18,13 @@ Install packages:
 python -m pip install -r requirements.txt
 ```
 
-Run the project:
-
-```powershell
-python -m app.scripts.demo_dedupe
-```
-
 Run the API:
 
 ```powershell
 uvicorn app.api:app --reload
 ```
 
-Optimize chunks:
+## API
 
 ```http
 POST /v1/optimize
@@ -61,109 +38,134 @@ POST /v1/optimize
   "token_budget": 1500,
   "target_k": 8,
   "dedup_threshold": 0.15,
+  "semantic_dedup_threshold": 0.001,
   "mmr_lambda": 0.5,
   "representative_strategy": "auto",
   "compress": true
 }
 ```
 
-SlimContext is a post-retrieval, pre-LLM layer. It accepts chunks from a vector database, BM25, hybrid search, tools, logs, or any other retriever, then returns cleaned, deduplicated, diversity-ranked chunks within a token budget. If chunks already include embeddings, the API reuses them and skips local embedding generation.
+`embedding` is optional. If any chunk is missing one, SlimContext embeds all chunks server-side using `embedding_model` (default: `BAAI/bge-small-en-v1.5`). If every chunk already has an embedding, client vectors are used as-is and embedding generation is skipped entirely.
 
-## RAG Benchmark
+`token_budget` is optional. When omitted or `null`, no token cap is applied after MMR.
 
-The benchmark compares two paths over the same Wikipedia-derived questions:
+## Benchmark
 
-| Path | Context sent to the answer model |
-|------|----------------------------------|
-| Without SlimContext | All retrieved Wikipedia chunks |
-| With SlimContext | Deduped, clustered, MMR-selected, compressed chunks within the token budget |
+Two paths were compared: send all retrieved chunks to the LLM as-is, or run them through SlimContext first (`target_k=1`, `dedup_threshold=0.15`, `mmr_lambda=0.8`, `compress=false`, caller-supplied embeddings). Answer correctness was checked with GPT-5.5 using only the provided context.
 
-Generate a fixed JSONL dataset:
+| Metric | Without SlimContext | With SlimContext | Change |
+|---|---:|---:|---|
+| Chunks sent to LLM | 5 | 1 | −4 (80%) |
+| Input tokens | 319 | 134 | −185 |
+| Token reduction | — | **57.99%** | — |
+| Exact duplicates removed | — | 1 | — |
+| Irrelevant chunks removed | — | 3 | — |
+| Clusters formed | — | 3 | — |
+| Budget-skipped chunks | — | 0 | — |
+| Answer correct | ✓ | ✓ | Same |
+| Optimize latency | — | **2 ms** | — |
 
-```powershell
-python benchmarks/build_wikipedia_dataset.py --pages 20 --questions-per-page 3
-```
-
-Run the benchmark with local Ollama Qwen for both answers and DeepEval judging:
-
-```powershell
-ollama pull qwen2.5:7b
-python benchmarks/benchmark_rag.py --dataset benchmarks/data/wikipedia_eval.jsonl --model qwen2.5:7b --judge-model qwen2.5:7b
-```
-
-Outputs are written to `benchmarks/results/`:
-
-| File | Purpose |
-|------|---------|
-| `summary.json` | Full aggregate metrics and per-case results |
-| `summary.csv` | README-friendly table data |
-| `benchmark_chart.png` | Visual comparison of tokens, quality, and cost |
-
-Latest benchmark table:
+Token cost proxy at $0.005 / 1K input tokens:
 
 | Metric | Without SlimContext | With SlimContext |
 |---|---:|---:|
-| Avg input tokens | 11,016 | 589 |
-| Token reduction | - | 94.65% |
-| Answer quality (LLM judge 1-10) | 1.67 | 8.67 |
-| Cost per 1M calls (Ollama Qwen token proxy) | $55.08 | $2.95 |
-| Pipeline latency added | 0ms | measured in `summary.json` |
+| Cost per request | $0.00160 | $0.00067 |
+| Cost per 1M requests | $1,595 | $670 |
+| Savings per 1M requests | — | **$925 (57.99%)** |
 
-Run details: 3 Wikipedia cases, `qwen2.5-coder:7b` for answer generation and DeepEval `GEval` judging, `BAAI/bge-small-en-v1.5` embeddings, `target_k=8`, `token_budget=1500`.
-
-![SlimContext benchmark](benchmarks/results/benchmark_chart.png)
-
-The cost line is a configurable token-burn proxy, not an Ollama bill:
-
-```text
-avg_input_tokens * 1_000_000 / 1000 * $0.000005
+```
+tokens_saved = input_tokens − output_tokens          → 319 − 134 = 185
+reduction_pct  = (tokens_saved / input_tokens) × 100 → 57.99%
+cost_per_req   = tokens × $0.000005
 ```
 
-Benchmark tips:
+With pre-supplied embeddings, SlimContext only ran dedup → cluster → MMR → budget enforcement — no server-side embedding work.
 
-| Goal | How |
-|------|-----|
-| Keep test runs short | Add `--limit 3` to `benchmark_rag.py` |
-| Avoid chart dependency during debugging | Add `--skip-chart` |
-| Change SlimContext budget | Use `--token-budget 1500` |
-| Change selected context count | Use `--target-k 8` |
-| Use another local model | Change `--model` and `--judge-model` |
+### Latency
+
+| Scenario | Observed / typical |
+|---|---|
+| Embeddings provided by caller | **2 ms** (observed) |
+| Server-side embedding, warm model | 200–600 ms |
+| First request, model loading from disk | 1–5 s |
+
+### Reproduce pipeline metrics
+
+Run the optimizer pipeline locally without an LLM API:
+
+```powershell
+python benchmarks/run_dirty_eval.py --target-k 1 --dedup-threshold 0.15 --mmr-lambda 0.8
+```
+
+Outputs go to `benchmarks/results/manual_eval/` (`summary.json`, `summary.csv`, spot-check prompt).
 
 ## Representative Selection
 
-`auto` is the recommended default. It selects by `score` when any chunk in the cluster has a retrieval score greater than `0`, because RAG chunks usually arrive already ranked by vector search, hybrid search, or reranking. If no usable score is present, it falls back to `centroid`.
+`auto` is the recommended default. It selects by `score` when any chunk in the cluster has a retrieval score greater than `0` — the normal case for RAG chunks ranked by a vector DB or reranker. Falls back to `centroid` when no usable score is present.
 
-`score` selects the chunk with the highest retrieval score in each cluster. Use this as the default RAG behavior when chunks are already ranked by a vector database, hybrid search system, or reranker.
-
-`centroid` selects the chunk closest to the average embedding of the cluster. Use this for generic chunks with no meaningful retrieval scores, such as logs, tool dumps, mixed-source content, or offline clustering jobs.
-
-`query_closest` selects the chunk whose embedding is closest to the query embedding. Use this for Q&A flows where the best answer to the user query matters more than choosing the most typical chunk in the cluster.
-
-`longest` selects the chunk with the most text. Use this when you want maximum information density, such as summarization preparation or context packing where longer chunks are preferred.
+| Strategy | When to use |
+|---|---|
+| `auto` | Default. Score-based when scores exist, centroid otherwise |
+| `score` | Chunks already ranked by vector DB, hybrid search, or reranker |
+| `centroid` | No meaningful scores — logs, tool dumps, mixed-source content |
+| `query_closest` | Q&A flows where proximity to the query matters most |
+| `longest` | Summarization or context packing where information density is preferred |
 
 ## Threshold Tuning
 
-Clustering uses `dedup_threshold` as a cosine distance threshold. Start with `0.15` for prose and `0.10` for code, then expose the value to users so they can tune it for their corpus. Lower values make clustering stricter; higher values merge more chunks together.
+Use two thresholds — they solve different problems:
+
+| Parameter | Purpose | Typical range |
+|---|---|---|
+| `semantic_dedup_threshold` | Remove near-duplicate embeddings before MMR (also requires high text overlap) | `0.001`–`0.02` |
+| `dedup_threshold` / `cluster_threshold` | Topical clustering for stats / optional `max_per_cluster` | `0.10`–`0.35` (looser) |
+
+`semantic_dedup_threshold` should stay tight so paraphrases and distinct use cases are not merged. `dedup_threshold` controls how aggressively chunks are grouped for `cluster_count` and optional per-cluster sampling (`max_per_cluster` > 1).
+
+With mock or low-dimensional embeddings, vectors often sit in a tight cone — rely on MMR plus the built-in text diversity penalty rather than expecting clustering alone to separate topics.
 
 ## MMR Selection
 
-MMR, or maximal marginal relevance, selects chunks with a greedy loop using `score = lambda * relevance - (1 - lambda) * diversity_penalty`. Relevance comes from `query_embedding` when provided; otherwise it uses normalized chunk `score`. The diversity penalty is the maximum cosine similarity between the candidate chunk and anything already selected.
+MMR (maximal marginal relevance) selects chunks with:
 
-`mmr_lambda` controls the relevance-diversity tradeoff. Values closer to `1.0` favor the most relevant or highest-scoring chunks, even if they are similar to each other. Values closer to `0.0` favor diversity and spread selections across different embedding areas. `0.5` is a balanced default.
+```
+score = lambda × relevance − (1 − lambda) × diversity_penalty
+```
 
-MMR enforces chunk count with `target_k`. Token budget is enforced after MMR with `enforce_token_budget`: whole chunks are packed in order until the budget is full. Chunks that alone exceed the budget, or would push the total over, are skipped (`stats.budget_skipped_count`).
+Relevance uses `query_embedding` when provided, otherwise normalized chunk `score`. The diversity penalty is the max cosine similarity between the candidate and anything already selected.
 
-If any chunk is missing an embedding, SlimContext re-embeds **all** chunks from text with `embedding_model` (Distill-style), so every vector lives in the same space. If every chunk already has an embedding, client vectors are used as-is.
+`mmr_lambda` controls the tradeoff. `1.0` = pure relevance, `0.0` = pure diversity, `0.5` = balanced default.
 
-When `query` is provided, SlimContext embeds it once per request and uses that vector for MMR relevance. Pass `query_embedding` to skip query embedding when you already have it from your retriever.
+`target_k` sets the chunk count limit. Token budget is enforced after MMR — chunks are packed in order until the budget is full. Chunks that would push the total over are skipped (`stats.budget_skipped_count`).
+
+## Tests
+
+```powershell
+python -m pytest tests/ -q
+```
+
+Fast checks use fake embeddings — no model download required.
+
+| File | What it verifies |
+|------|------------------|
+| `test_dedupe.py` | Exact duplicate removal and namespace isolation |
+| `test_semantic_dedup.py` | Embedding + text gated near-duplicate removal |
+| `test_realworld_redis.py` | Diverse Redis RAG selection (no single-chunk collapse) |
+| `test_clustering.py` | Similar vectors cluster together |
+| `test_mmr.py` | MMR `target_k` and token budget skipping |
+| `test_embeddings.py` | Re-embed-all when any embedding is missing |
+| `test_api.py` | Full HTTP endpoint with precomputed vectors |
+| `test_benchmark_metrics.py` | Token reduction, cost, and summary math |
+| `test_benchmark_rag.py` | Benchmark prompt construction smoke test |
 
 ## Project Structure
 
-```text
+```
 app/
   api.py                 FastAPI app and /v1/optimize endpoint
   core/
-    clustering.py        Agglomerative clustering and representative selection
+    clustering.py        Agglomerative clustering and per-cluster candidate selection
+    semantic_dedup.py    Tight embedding near-duplicate removal
     compression.py       Lightweight prune and structured placeholder compression
     dedupe.py            Exact hash dedupe and MinHash near-duplicate helpers
     mmr.py               MMR ranking and token-budget packing
@@ -173,7 +175,10 @@ app/
     demo_dedupe.py       Local dedupe demo
     embedding_generator.py
 benchmarks/
-  build_wikipedia_dataset.py
+  build_dirty_squad_dataset.py
+  run_dirty_eval.py
   benchmark_rag.py
   metrics.py
+  data/
+    dirty_test_set.json
 ```

@@ -4,10 +4,11 @@ from typing import Any, Literal
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
-from app.core.clustering import cluster_chunks, select_representatives
+from app.core.clustering import cluster_chunks, select_cluster_candidates, select_representatives
 from app.core.compression import compress_chunks
 from app.core.dedupe import remove_exact_duplicate_chunks
 from app.core.mmr import enforce_token_budget, select_mmr
+from app.core.semantic_dedup import remove_semantic_duplicate_chunks
 from app.core.vectors import validate_embedding_dimensions
 
 Embedding = list[float]
@@ -46,9 +47,31 @@ class OptimizeRequest(BaseModel):
     chunks: list[ChunkIn] = Field(min_length=1, max_length=MAX_CHUNKS_PER_REQUEST)
     query: str = ""
     namespace: str = "default"
-    token_budget: int = Field(default=1500, ge=1)
+    token_budget: int | None = Field(default=None, ge=1)
     target_k: int = Field(default=8, ge=1)
-    dedup_threshold: float = Field(default=0.15, gt=0, le=2)
+    dedup_threshold: float = Field(
+        default=0.15,
+        gt=0,
+        le=2,
+        description="Cosine distance threshold for topical clustering (stats and optional pre-MMR grouping).",
+    )
+    semantic_dedup_threshold: float = Field(
+        default=0.001,
+        gt=0,
+        le=2,
+        description="Tight cosine distance threshold for near-duplicate removal before MMR.",
+    )
+    cluster_threshold: float | None = Field(
+        default=None,
+        gt=0,
+        le=2,
+        description="Optional override for topical clustering; defaults to dedup_threshold.",
+    )
+    max_per_cluster: int = Field(
+        default=1,
+        ge=1,
+        description="When >1, pass up to this many scored chunks per cluster into MMR instead of all chunks.",
+    )
     mmr_lambda: float = Field(default=0.5, ge=0, le=1)
     representative_strategy: RepresentativeStrategy = "auto"
     compress: bool = True
@@ -68,6 +91,7 @@ class OptimizeStats(BaseModel):
     input_count: int
     output_count: int
     exact_duplicate_count: int
+    semantic_duplicate_count: int = 0
     cluster_count: int
     input_tokens: int
     output_tokens: int
@@ -100,28 +124,57 @@ def optimize(request: OptimizeRequest) -> OptimizeResponse:
         query_embedding = _query_embedding_for_request(request)
         validate_embedding_dimensions(exact_unique_chunks, query_embedding)
 
-        clusters = cluster_chunks(
+        semantic_unique_chunks, semantic_duplicate_count = remove_semantic_duplicate_chunks(
             exact_unique_chunks,
-            dedup_threshold=request.dedup_threshold,
+            threshold=request.semantic_dedup_threshold,
         )
-        representatives = select_representatives(
-            clusters,
-            representative_strategy=request.representative_strategy,
-            query_embedding=query_embedding,
+
+        cluster_distance = (
+            request.cluster_threshold
+            if request.cluster_threshold is not None
+            else request.dedup_threshold
         )
+        clusters = cluster_chunks(
+            semantic_unique_chunks,
+            dedup_threshold=cluster_distance,
+        )
+
+        if request.max_per_cluster > 1:
+            mmr_candidates = select_cluster_candidates(
+                clusters,
+                max_per_cluster=request.max_per_cluster,
+                representative_strategy=request.representative_strategy,
+                query_embedding=query_embedding,
+            )
+        else:
+            representatives = select_representatives(
+                clusters,
+                representative_strategy=request.representative_strategy,
+                query_embedding=query_embedding,
+            )
+            mmr_candidates = (
+                representatives
+                if len(representatives) > 1
+                else semantic_unique_chunks
+            )
+
         mmr_chunks = select_mmr(
-            representatives,
+            mmr_candidates,
             target_k=request.target_k,
             mmr_lambda=request.mmr_lambda,
             query_embedding=query_embedding,
         )
 
         final_candidates = compress_chunks(mmr_chunks) if request.compress else mmr_chunks
-        final_chunks, budget_skipped_count = enforce_token_budget(
-            final_candidates,
-            request.token_budget,
-            token_counter=lambda chunk: _count_text_tokens(chunk.get("text", "")),
-        )
+        if request.token_budget is None:
+            final_chunks = final_candidates
+            budget_skipped_count = 0
+        else:
+            final_chunks, budget_skipped_count = enforce_token_budget(
+                final_candidates,
+                request.token_budget,
+                token_counter=lambda chunk: _count_text_tokens(chunk.get("text", "")),
+            )
 
         output_tokens = sum(_count_text_tokens(chunk["text"]) for chunk in final_chunks)
         latency_ms = int((time.perf_counter() - started_at) * 1000)
@@ -132,6 +185,7 @@ def optimize(request: OptimizeRequest) -> OptimizeResponse:
                 input_count=len(chunks),
                 output_count=len(final_chunks),
                 exact_duplicate_count=len(chunks) - len(exact_unique_chunks),
+                semantic_duplicate_count=semantic_duplicate_count,
                 cluster_count=len(clusters),
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,

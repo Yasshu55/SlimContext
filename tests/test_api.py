@@ -56,3 +56,32 @@ def test_optimize_with_precomputed_embeddings() -> None:
     assert "cluster_sizes" not in body["stats"]
     assert len(body["chunks"]) == 2
     assert all("embedding" not in chunk for chunk in body["chunks"])
+
+
+def test_optimize_without_token_budget_does_not_skip_large_chunks() -> None:
+    payload = {
+        "chunks": [
+            {
+                "id": "1",
+                "text": "alpha " * 1600,
+                "embedding": _unit_vector(0),
+                "score": 0.9,
+            },
+            {
+                "id": "2",
+                "text": "beta " * 1600,
+                "embedding": _unit_vector(1),
+                "score": 0.8,
+            },
+        ],
+        "namespace": "docs",
+        "target_k": 2,
+        "compress": False,
+    }
+
+    response = client.post("/v1/optimize", json=payload)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["stats"]["output_count"] == 2
+    assert body["stats"]["budget_skipped_count"] == 0
