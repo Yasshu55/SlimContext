@@ -277,26 +277,6 @@ Interpretation: high **reduction** is expected with `target_k=1`. **Truth retent
 
 ---
 
-## Tests
-
-```powershell
-python -m pytest tests/ -q
-```
-
-Unit tests use synthetic embeddings — no model download required.
-
-| Test | Covers |
-|------|--------|
-| `test_dedupe.py` | Exact duplicate removal, namespace isolation |
-| `test_semantic_dedup.py` | Paraphrase / near-duplicate removal |
-| `test_realworld_redis.py` | Multi-topic RAG set (no single-chunk collapse) |
-| `test_clustering.py` | Vector clustering |
-| `test_mmr.py` | `target_k`, token budget |
-| `test_api.py` | HTTP `/v1/optimize` |
-| `test_embeddings.py` | Re-embed when any vector is missing |
-
----
-
 ## Project layout
 
 ```
