@@ -3,7 +3,6 @@
 import numpy as np
 
 from app.core.dedupe import normalize_text
-from app.core.intent import intent_key
 from app.core.text_similarity import text_similarity, tfidf_similarity_matrix
 from app.core.vectors import embedding_matrix, normalize_embeddings
 
@@ -60,33 +59,9 @@ def remove_semantic_duplicate_chunks(
         kept_indexes.append(index)
         kept_embeddings.append(embedding)
 
-    pairwise_unique = [chunks[index] for index in sorted(kept_indexes)]
-    intent_unique, intent_removed = _collapse_intent_duplicates(pairwise_unique)
-
-    removed_count = len(chunks) - len(intent_unique)
-    return intent_unique, removed_count
-
-
-def _collapse_intent_duplicates(chunks: list[Chunk]) -> tuple[list[Chunk], int]:
-    """Keep the highest-scored chunk for each topical intent label."""
-    if not chunks:
-        return [], 0
-
-    best_by_intent: dict[str, Chunk] = {}
-    general_chunks: list[Chunk] = []
-
-    for chunk in sorted(chunks, key=lambda item: item.get("score", 0.0), reverse=True):
-        label = intent_key(chunk.get("text", ""))
-        if label == "general":
-            general_chunks.append(chunk)
-            continue
-
-        if label not in best_by_intent:
-            best_by_intent[label] = chunk
-
-    kept = list(best_by_intent.values()) + general_chunks
-    kept.sort(key=lambda chunk: chunk.get("score", 0.0), reverse=True)
-    return kept, len(chunks) - len(kept)
+    unique = [chunks[index] for index in sorted(kept_indexes)]
+    removed_count = len(chunks) - len(unique)
+    return unique, removed_count
 
 
 def _effective_semantic_threshold(embeddings: np.ndarray, threshold: float) -> float:
@@ -134,14 +109,6 @@ def _is_semantic_duplicate(
 
     if distance < threshold and text_overlap >= 0.55:
         return True
-
-    if intent_key(candidate.get("text", "")) == intent_key(kept.get("text", "")):
-        intent_label = intent_key(candidate.get("text", ""))
-        if intent_label != "general" and (
-            tfidf_similarity >= TFIDF_PARAPHRASE_SIMILARITY
-            or (embedding_similarity >= EMBEDDING_NEAR_COPY_SIMILARITY and tfidf_similarity >= 0.08)
-        ):
-            return True
 
     return False
 
