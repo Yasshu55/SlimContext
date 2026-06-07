@@ -1,10 +1,8 @@
-from collections import defaultdict
+from typing import Literal
 
 from sklearn.cluster import AgglomerativeClustering
 import numpy as np
 
-from app.core.intent import intent_key
-from app.core.text_similarity import median_embedding_distance, text_similarity, tfidf_similarity_matrix
 from app.core.vectors import (
     cosine_similarity,
     embedding_matrix,
@@ -13,12 +11,15 @@ from app.core.vectors import (
 
 Chunk = dict
 Cluster = dict
+ClusterLinkage = Literal["single", "complete", "average"]
 
 
 def cluster_chunks(
     chunks: list[Chunk],
     dedup_threshold: float = 0.15,
+    linkage: ClusterLinkage = "average",
 ) -> list[Cluster]:
+    """Agglomerative clustering on cosine distance."""
     if not chunks:
         return []
 
@@ -28,41 +29,17 @@ def cluster_chunks(
     if dedup_threshold <= 0:
         raise ValueError("dedup_threshold must be greater than 0.")
 
-    intent_clusters = _cluster_by_intent(chunks)
-    if intent_clusters is not None:
-        return intent_clusters
+    if linkage not in {"single", "complete", "average"}:
+        raise ValueError("linkage must be one of: single, complete, average")
 
-    return _cluster_by_hybrid_distance(chunks, dedup_threshold)
-
-
-def _cluster_by_intent(chunks: list[Chunk]) -> list[Cluster] | None:
-    grouped: dict[str, list[Chunk]] = defaultdict(list)
-
-    for chunk in chunks:
-        grouped[intent_key(chunk.get("text", ""))].append(chunk)
-
-    topical_labels = [label for label in grouped if label != "general"]
-    if len(topical_labels) < 2:
-        return None
-
-    clusters = [
-        {"id": cluster_id, "chunks": grouped[label]}
-        for cluster_id, label in enumerate(sorted(grouped))
-    ]
-    return clusters
-
-
-def _cluster_by_hybrid_distance(chunks: list[Chunk], dedup_threshold: float) -> list[Cluster]:
     embeddings = normalize_embeddings(embedding_matrix(chunks))
-    texts = [chunk.get("text", "") for chunk in chunks]
-    tfidf_matrix = tfidf_similarity_matrix(texts)
-    distance_matrix = _hybrid_distance_matrix(embeddings, tfidf_matrix, texts)
+    distance_matrix = _cosine_distance_matrix(embeddings)
 
     model = AgglomerativeClustering(
         n_clusters=None,
         distance_threshold=dedup_threshold,
         metric="precomputed",
-        linkage="complete",
+        linkage=linkage,
     )
     labels = model.fit_predict(distance_matrix)
 
@@ -79,30 +56,28 @@ def _cluster_by_hybrid_distance(chunks: list[Chunk], dedup_threshold: float) -> 
     return clusters
 
 
-def _hybrid_distance_matrix(
-    embeddings: np.ndarray,
-    tfidf_matrix: np.ndarray,
-    texts: list[str],
-) -> np.ndarray:
-    count = len(texts)
+def _cosine_distance_matrix(embeddings: np.ndarray) -> np.ndarray:
+    count = embeddings.shape[0]
     matrix = np.zeros((count, count), dtype=np.float32)
-    collapsed = median_embedding_distance(embeddings) < 0.02
-    text_weight = 0.85 if collapsed else 0.45
 
     for left in range(count):
         for right in range(left + 1, count):
-            embedding_distance = 1.0 - float(embeddings[left] @ embeddings[right])
-            lexical_distance = 1.0 - max(
-                float(tfidf_matrix[left, right]),
-                text_similarity(texts[left], texts[right]),
-            )
-            distance = (
-                (1.0 - text_weight) * embedding_distance + text_weight * lexical_distance
-            )
+            distance = 1.0 - float(embeddings[left] @ embeddings[right])
             matrix[left, right] = distance
             matrix[right, left] = distance
 
     return matrix
+
+
+def select_top_k_by_score(chunks: list[Chunk], k: int) -> list[Chunk]:
+    """Return up to k chunks sorted by retrieval score ( fallback when MMR is off)."""
+    if k <= 0:
+        return []
+
+    if len(chunks) <= k:
+        return list(chunks)
+
+    return sorted(chunks, key=lambda chunk: chunk.get("score", 0.0), reverse=True)[:k]
 
 
 def select_representatives(

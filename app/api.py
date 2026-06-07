@@ -4,7 +4,12 @@ from typing import Any, Literal
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
-from app.core.clustering import cluster_chunks, select_cluster_candidates, select_representatives
+from app.core.clustering import (
+    cluster_chunks,
+    select_cluster_candidates,
+    select_representatives,
+    select_top_k_by_score,
+)
 from app.core.compression import compress_chunks
 from app.core.dedupe import remove_exact_duplicate_chunks
 from app.core.mmr import enforce_token_budget, select_mmr
@@ -67,10 +72,18 @@ class OptimizeRequest(BaseModel):
         le=2,
         description="Optional override for topical clustering; defaults to dedup_threshold.",
     )
+    cluster_linkage: Literal["single", "complete", "average"] = Field(
+        default="average",
+        description="Agglomerative linkage (default: average).",
+    )
     max_per_cluster: int = Field(
         default=1,
         ge=1,
-        description="When >1, pass up to this many scored chunks per cluster into MMR instead of all chunks.",
+        description="When >1, pass up to this many scored chunks per cluster into selection instead of one representative.",
+    )
+    enable_mmr: bool = Field(
+        default=True,
+        description="When true, apply MMR when candidates exceed target_k; otherwise take top-k by score.",
     )
     mmr_lambda: float = Field(default=0.5, ge=0, le=1)
     representative_strategy: RepresentativeStrategy = "auto"
@@ -137,35 +150,34 @@ def optimize(request: OptimizeRequest) -> OptimizeResponse:
         clusters = cluster_chunks(
             semantic_unique_chunks,
             dedup_threshold=cluster_distance,
+            linkage=request.cluster_linkage,
         )
 
         if request.max_per_cluster > 1:
-            mmr_candidates = select_cluster_candidates(
+            selection_candidates = select_cluster_candidates(
                 clusters,
                 max_per_cluster=request.max_per_cluster,
                 representative_strategy=request.representative_strategy,
                 query_embedding=query_embedding,
             )
         else:
-            representatives = select_representatives(
+            selection_candidates = select_representatives(
                 clusters,
                 representative_strategy=request.representative_strategy,
                 query_embedding=query_embedding,
             )
-            mmr_candidates = (
-                representatives
-                if len(representatives) > 1
-                else semantic_unique_chunks
-            )
 
-        mmr_chunks = select_mmr(
-            mmr_candidates,
+        selected_chunks = _finalize_selection(
+            selection_candidates,
             target_k=request.target_k,
+            enable_mmr=request.enable_mmr,
             mmr_lambda=request.mmr_lambda,
             query_embedding=query_embedding,
         )
 
-        final_candidates = compress_chunks(mmr_chunks) if request.compress else mmr_chunks
+        final_candidates = (
+            compress_chunks(selected_chunks) if request.compress else selected_chunks
+        )
         if request.token_budget is None:
             final_chunks = final_candidates
             budget_skipped_count = 0
@@ -198,6 +210,29 @@ def optimize(request: OptimizeRequest) -> OptimizeResponse:
         raise HTTPException(status_code=400, detail=str(error)) from error
 
 
+def _finalize_selection(
+    candidates: list[dict],
+    *,
+    target_k: int,
+    enable_mmr: bool,
+    mmr_lambda: float,
+    query_embedding: Embedding | None,
+) -> list[dict]:
+    """MMR when enabled and over target_k; else top-k by score."""
+    if len(candidates) <= target_k:
+        return candidates
+
+    if enable_mmr:
+        return select_mmr(
+            candidates,
+            target_k=target_k,
+            mmr_lambda=mmr_lambda,
+            query_embedding=query_embedding,
+        )
+
+    return select_top_k_by_score(candidates, target_k)
+
+
 def _needs_query_embedding(request: OptimizeRequest) -> bool:
     if request.query_embedding is not None:
         return False
@@ -214,7 +249,7 @@ def _has_embedding(chunk: dict) -> bool:
 
 
 def _ensure_embeddings(chunks: list[dict], embedding_model: str) -> None:
-    """Embed all chunks when any embedding is missing (Distill-style, single vector space)."""
+    """Embed all chunks when any embedding is missing , single vector space)."""
     if not chunks:
         return
 

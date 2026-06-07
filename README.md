@@ -41,22 +41,22 @@ Vector DB / BM25 / hybrid search
 ### End-to-end pipeline
 
 ```
-┌─────────────┐   ┌──────────────────┐   ┌─────────────────┐   ┌──────────────┐
-│ Exact dedup │ → │ Semantic dedup   │ → │ Topical cluster │ → │ Representative│
-│ (hash)      │   │ (paraphrase +    │   │ (intent / hybrid│   │ (1 per cluster)│
-│             │   │  intent collapse)│   │  text+embedding)│   │               │
-└─────────────┘   └──────────────────┘   └─────────────────┘   └───────┬──────┘
-                                                                         ↓
+┌─────────────┐   ┌──────────────────┐   ┌─────────────────────┐   ┌──────────────┐
+│ Exact dedup │ → │ Semantic dedup   │ → │ Agglomerative       │ → │ Representative│
+│ (hash)      │   │ (embedding +     │   │ cluster (cosine   │   │ (1 per cluster)│
+│             │   │  lexical)        │   │  distance)│   │               │
+└─────────────┘   └──────────────────┘   └─────────────────────┘   └───────┬──────┘
+                                                                             ↓
 ┌─────────────┐   ┌──────────────────┐   ┌─────────────────────────────────┐
-│ Compression │ ← │ Token budget     │ ← │ MMR selection (relevance +       │
-│ (optional)  │   │ (pack in order)  │   │  diversity across topics)        │
+│ Compression │ ← │ Token budget     │ ← │ MMR (optional) or top-k by score │
+│ (optional)  │   │ (pack in order)  │   │                                  │
 └─────────────┘   └──────────────────┘   └─────────────────────────────────┘
 ```
 
-Canonical RAG optimization path:
+Canonical RAG optimization path 
 
 ```
-Query → Over-fetch (N) → Cluster → Select → MMR (k) → LLM
+Query → Over-fetch (N) → Cluster → Select → [MMR] (k) → LLM
 ```
 
 SlimContext adds an explicit **semantic dedup** stage before clustering so paraphrases do not consume `target_k` slots.
@@ -67,10 +67,10 @@ SlimContext adds an explicit **semantic dedup** stage before clustering so parap
 |-------|----------------|---------------|
 | **1. Exact dedup** | SHA-256 hash of normalized text, scoped by `namespace`. | Cheap, perfect removal of copy-paste duplicates from multi-source retrieval. |
 | **2. Embed** (optional) | If any chunk lacks an embedding, encode all texts with `BAAI/bge-small-en-v1.5` (single vector space). | Clustering and MMR need vectors; callers with precomputed embeddings skip this entirely. |
-| **3. Semantic dedup** | Two passes on chunks still ranked by retrieval `score`: **(a) Pairwise paraphrase removal** — drop a lower-scored chunk when embeddings are nearly identical *and* TF-IDF overlap suggests the same claim (not merely the same topic). **(b) Intent collapse** — assign a lightweight topic label from keywords (e.g. `caching`, `session`, `messaging`, `rate_limiting`) and keep only the top-scored chunk per label. | Example: five retrieved passages all explain “Redis caches hot data in RAM” (`redis_core_1`, `redis_cache_paraphrase`, `semantic_overlap_1`, …). After this stage you keep **one** caching passage (highest score), plus separate winners for session storage, pub/sub, persistence, etc. That is different from topical clustering (layer 4), which groups what is left; semantic dedup answers “have we already said this?” |
-| **4. Topical clustering** | Group remaining chunks by intent labels when possible; otherwise agglomerative clustering on a **hybrid** distance (text-weighted when embeddings are collapsed). | Produces meaningful `cluster_count` and one representative per *idea*, not one blob per embedding cone. |
-| **5. Representative selection** | Pick the best chunk per cluster (`auto` = highest retrieval `score`, or centroid / query-closest / longest). | Reduces each topic to its strongest evidence before diversity ranking. |
-| **6. MMR** | Maximal Marginal Relevance: `λ × relevance − (1−λ) × diversity_penalty`. Diversity uses embedding similarity **and** lexical overlap vs. already-selected chunks. | Maximizes **marginal information gain** under `target_k`, not raw cosine score alone. |
+| **3. Semantic dedup** | Pairwise paraphrase removal on chunks ranked by retrieval `score`: drop a lower-scored chunk when embeddings are nearly identical *and* TF-IDF / lexical overlap suggests the same claim (not merely the same topic). | Example: five passages all explain “Redis caches hot data in RAM” — keep the highest-scored one. Semantic dedup answers “have we already said this?” |
+| **4. Topical clustering** | Agglomerative clustering on **cosine distance** between embeddings ( default linkage `average`, threshold `dedup_threshold`). | Groups semantically similar chunks so one representative can stand in for the cluster. |
+| **5. Representative selection** | Pick the best chunk per cluster (`auto` = highest retrieval `score`, or centroid / query-closest / longest). | Reduces each topic to its strongest evidence before final selection. |
+| **6. MMR (optional)** | When `enable_mmr=true` and candidates exceed `target_k`: Maximal Marginal Relevance `λ × relevance − (1−λ) × diversity_penalty`. When disabled: top `target_k` by retrieval `score`. | Balances relevance and diversity under `target_k` . |
 | **7. Compression** | Light filler removal; structured text truncated with a placeholder. | Cuts noise without an LLM summarizer. |
 | **8. Token budget** | Pack whole chunks in MMR order until `token_budget` is full; skip chunks that do not fit. | Hard cap for model context windows and cost control. |
 
@@ -126,6 +126,8 @@ Health check: `GET http://127.0.0.1:8000/health`
   "token_budget": 1800,
   "semantic_dedup_threshold": 0.001,
   "dedup_threshold": 0.15,
+  "cluster_linkage": "average",
+  "enable_mmr": true,
   "mmr_lambda": 0.5,
   "representative_strategy": "auto",
   "compress": true
@@ -163,9 +165,11 @@ Health check: `GET http://127.0.0.1:8000/health`
 | `target_k` | `8` | Max chunks after MMR. |
 | `token_budget` | optional | Max tokens after MMR; `null` = no cap. |
 | `semantic_dedup_threshold` | `0.001` | Tight cosine distance for paraphrase detection (see tuning). |
-| `dedup_threshold` | `0.15` | Topical clustering distance (looser than semantic dedup). |
+| `dedup_threshold` | `0.15` | Cosine distance threshold for agglomerative clustering. |
 | `cluster_threshold` | optional | Overrides `dedup_threshold` for clustering only. |
-| `mmr_lambda` | `0.5` | `1.0` = relevance only, `0.0` = diversity only. |
+| `cluster_linkage` | `average` | Agglomerative linkage: `single`, `complete`, or `average`. |
+| `enable_mmr` | `true` | Apply MMR when candidates exceed `target_k`; if `false`, take top-k by `score`. |
+| `mmr_lambda` | `0.5` | `1.0` = relevance only, `0.0` = diversity only (only when `enable_mmr=true`). |
 | `representative_strategy` | `auto` | `auto` \| `score` \| `centroid` \| `query_closest` \| `longest` |
 | `max_per_cluster` | `1` | If `>1`, send up to N chunks per cluster into MMR before final selection. |
 | `compress` | `true` | Apply lightweight compression to output text. |
@@ -289,7 +293,6 @@ app/
     mmr.py                # MMR + token budget packing
     compression.py        # Deterministic text pruning
     text_similarity.py    # Lexical / TF-IDF helpers
-    intent.py             # Lightweight topic labels
     vectors.py            # Embedding utilities
 benchmarks/
   run_dirty_eval.py       # Pipeline metrics without an LLM

@@ -58,6 +58,42 @@ def test_optimize_with_precomputed_embeddings() -> None:
     assert all("embedding" not in chunk for chunk in body["chunks"])
 
 
+def test_optimize_with_mmr_disabled_uses_top_score() -> None:
+    payload = {
+        "chunks": [
+            {
+                "id": "high",
+                "text": "topic a high score",
+                "embedding": _unit_vector(0),
+                "score": 0.99,
+            },
+            {
+                "id": "low",
+                "text": "topic b low score",
+                "embedding": _unit_vector(1),
+                "score": 0.1,
+            },
+            {
+                "id": "mid",
+                "text": "topic c mid score",
+                "embedding": _unit_vector(2),
+                "score": 0.5,
+            },
+        ],
+        "namespace": "docs",
+        "target_k": 1,
+        "enable_mmr": False,
+        "compress": False,
+    }
+
+    response = client.post("/v1/optimize", json=payload)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["stats"]["output_count"] == 1
+    assert body["chunks"][0]["id"] == "high"
+
+
 def test_optimize_without_token_budget_does_not_skip_large_chunks() -> None:
     payload = {
         "chunks": [

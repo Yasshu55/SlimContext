@@ -8,7 +8,11 @@ from pathlib import Path
 
 import numpy as np
 
-from app.core.clustering import cluster_chunks, select_representatives
+from app.core.clustering import (
+    cluster_chunks,
+    select_representatives,
+    select_top_k_by_score,
+)
 from app.core.compression import compress_chunks
 from app.core.dedupe import remove_exact_duplicate_chunks
 from app.core.mmr import enforce_token_budget, select_mmr
@@ -26,6 +30,11 @@ def main() -> None:
     parser.add_argument("--dedup-threshold", type=float, default=0.15)
     parser.add_argument("--semantic-dedup-threshold", type=float, default=0.001)
     parser.add_argument("--mmr-lambda", type=float, default=0.8)
+    parser.add_argument(
+        "--enable-mmr",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     args = parser.parse_args()
 
     cases = json.loads(Path(args.input).read_text(encoding="utf-8"))
@@ -41,6 +50,7 @@ def main() -> None:
             dedup_threshold=args.dedup_threshold,
             semantic_dedup_threshold=args.semantic_dedup_threshold,
             mmr_lambda=args.mmr_lambda,
+            enable_mmr=args.enable_mmr,
         )
         for case in cases
     ]
@@ -73,6 +83,7 @@ def run_case(
     dedup_threshold: float,
     semantic_dedup_threshold: float,
     mmr_lambda: float,
+    enable_mmr: bool,
 ) -> dict:
     started_at = time.perf_counter()
     dirty_chunks = [_with_embedding(chunk) for chunk in case["dirty_chunks"]]
@@ -88,11 +99,16 @@ def run_case(
     )
     clusters = cluster_chunks(semantic_unique_chunks, dedup_threshold=dedup_threshold)
     representatives = select_representatives(clusters, representative_strategy="auto")
-    selected = select_mmr(
-        representatives,
-        target_k=target_k,
-        mmr_lambda=mmr_lambda,
-    )
+    if len(representatives) <= target_k:
+        selected = representatives
+    elif enable_mmr:
+        selected = select_mmr(
+            representatives,
+            target_k=target_k,
+            mmr_lambda=mmr_lambda,
+        )
+    else:
+        selected = select_top_k_by_score(representatives, target_k)
     compressed = compress_chunks(selected)
     optimized, budget_skipped_count = enforce_token_budget(
         compressed,
